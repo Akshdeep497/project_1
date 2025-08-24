@@ -1,6 +1,8 @@
-# Streamlit: Loitering + Abandoned Bag + Robust Unusual (running) detection
-# Less sensitive unusual: camera stabilization + body-lengths/sec + longer sustain
-# Run: pip install -r requirements.txt && streamlit run app.py
+# Streamlit: Loitering + Abandoned Bag + robust Unusual (running) detection
+# Uses camera stabilization + foot-point motion normalized by body height.
+# Run:
+#   pip install -r requirements.txt
+#   streamlit run app.py
 
 import os, io, zipfile, tempfile, time, math
 from collections import deque
@@ -14,7 +16,7 @@ from ultralytics import YOLO
 import cv2
 import imageio.v3 as iio
 
-# =============== helpers ===============
+# ----------------- helpers -----------------
 def iou(a, b):
     x1 = max(a[0], b[0]); y1 = max(a[1], b[1])
     x2 = min(a[2], b[2]); y2 = min(a[3], b[3])
@@ -50,25 +52,21 @@ class SimpleTracker:
         boxes = [d[0] for d in dets]
         unmatched = set(range(len(dets)))
 
-        # match
+        # match existing
         for tid, t in list(self.tracks.items()):
             best_j = -1; best_iou = 0.0
             for j in list(unmatched):
                 iou_ = iou(t['box'], boxes[j])
-                if iou_ > best_iou:
-                    best_iou, best_j = iou_, j
+                if iou_ > best_iou: best_iou, best_j = iou_, j
             if best_iou >= self.iou_thr:
-                t['box'] = boxes[best_j]
-                t['cls'] = dets[best_j][1]
-                t['conf'] = dets[best_j][2]
+                t['box'] = boxes[best_j]; t['cls'] = dets[best_j][1]; t['conf'] = dets[best_j][2]
                 t['lost'] = 0
-                # raw center history (we also keep stabilized history externally)
                 t['history_raw'].append(xyxy_to_cxcy(boxes[best_j]))
                 unmatched.discard(best_j)
             else:
                 t['lost'] += 1
 
-        # purge
+        # remove stale
         for tid in [tid for tid,t in self.tracks.items() if t['lost'] > self.max_lost]:
             del self.tracks[tid]
 
@@ -77,8 +75,9 @@ class SimpleTracker:
             self.tracks[self.next_id] = {
                 'box': boxes[j], 'cls': dets[j][1], 'conf': dets[j][2], 'lost': 0,
                 'history_raw': deque([xyxy_to_cxcy(boxes[j])], maxlen=self.history_len),
-                'history_stab': deque(maxlen=self.history_len), # stabilized centers
-                'hist_h': deque(maxlen=self.history_len),       # bbox heights
+                'history_stab': deque(maxlen=self.history_len),   # stabilized centers
+                'foot_hist': deque(maxlen=self.history_len),      # stabilized bottom-center
+                'hist_h': deque(maxlen=self.history_len),         # bbox heights
                 # behavior state
                 'entered_roi_frame': None, 'loiter_alerted': False,
                 'stationary_since': None, 'stationary_frames': 0,
@@ -89,18 +88,16 @@ class SimpleTracker:
             }
             self.next_id += 1
 
-        # age
+        # age live tracks
         for t in self.tracks.values():
             if t['lost'] == 0: t['age_frames'] = t.get('age_frames', 0) + 1
 
         return self.tracks
 
 class GlobalMotion:
-    """Global translation via phase correlation (to stabilize camera shake/pan)."""
+    """Global translation via phase correlation to compensate camera motions."""
     def __init__(self, scale=0.5):
-        self.prev = None
-        self.scale = scale
-        self.win = None
+        self.prev = None; self.scale = scale; self.win = None
         self.cum = np.array([0.0, 0.0], dtype=np.float32)
 
     def update(self, frame_bgr):
@@ -110,11 +107,9 @@ class GlobalMotion:
         if self.prev is None:
             self.prev = f32
             self.win = cv2.createHanningWindow((f32.shape[1], f32.shape[0]), cv2.CV_32F)
-            return self.cum.copy()  # zero shift initially
-        # phase correlation (windowed)
+            return self.cum.copy()
         (dx, dy), _ = cv2.phaseCorrelate(self.prev * self.win, f32 * self.win)
         self.prev = f32
-        # convert to full-res pixels (note: phaseCorrelate returns (dx, dy) in x,y order)
         self.cum += np.array([dx / self.scale, dy / self.scale], dtype=np.float32)
         return self.cum.copy()
 
@@ -142,29 +137,29 @@ def in_roi(box, roi_poly, W, H):
     cx, cy = xyxy_to_cxcy(box)
     return cv2.pointPolygonTest(np.array(roi_poly, dtype=np.int32), (int(cx), int(cy)), False) >= 0
 
-# =============== core pipeline ===============
+# ----------------- core -----------------
 def process_video(
     source_path: str,
     out_dir: str,
     weights: str = "yolov8n.pt",
     conf_thres: float = 0.45,
     # Loitering
-    loiter_sec: float = 60.0,
-    speed_px_per_sec_thr: float = 25.0,
+    loiter_sec: float = 10.0,
+    speed_px_per_sec_thr: float = 27.0,
     radius_px_thr: float = 20.0,
-    # Unusual (conservative, running-focused)
+    # Unusual (running-focused)
     enable_unusual: bool = True,
-    norm_speed_bls_thr: float = 1.5,  # body-lengths/sec threshold (running ~1.5–2.5)
-    min_unusual_sec: float = 2.0,
+    norm_speed_bls_thr: float = 1.30,     # body-lengths/sec threshold
+    min_unusual_sec: float = 1.2,
     unusual_cooldown_sec: float = 4.0,
     one_unusual_per_track: bool = True,
     min_track_age_sec: float = 1.0,
     # Abandoned bag
-    bag_stationary_sec: float = 25.0,
-    owner_gap_sec: float = 12.0,
+    bag_stationary_sec: float = 8.0,
+    owner_gap_sec: float = 8.0,
     # Filters
-    min_box_area_ratio: float = 0.010,  # ignore tiny boxes (1% of frame)
-    history_len_frames: int = 90,       # longer window → steadier stats
+    min_box_area_ratio: float = 0.010,    # ignore tiny boxes (1% of frame)
+    history_len_frames: int = 90,
     # Misc
     progress_cb: Optional[Callable[[float], None]] = None,
     roi_poly: Optional[List[Tuple[int,int]]] = None
@@ -194,17 +189,17 @@ def process_video(
     events = []
     frame_idx = -1
 
-    # simple EMA smoothing for stabilized centers
-    def ema(prev, cur, alpha=0.6):
+    # EMA smoothing for stabilized features (light smoothing, more responsive)
+    def ema(prev, cur, alpha=0.4):
         return (alpha*prev[0] + (1-alpha)*cur[0], alpha*prev[1] + (1-alpha)*cur[1])
 
     for frame in frames:
         frame_idx += 1
 
-        # 1) global camera stabilization (cumulative shift)
-        cum_shift = gm.update(frame)  # (sx, sy) to subtract from centers
+        # 1) camera stabilization
+        cum_shift = gm.update(frame)  # (sx, sy) to subtract
 
-        # 2) detect persons & bags (filter small)
+        # 2) detect persons & bags
         res = model.predict(frame, imgsz=max(640, W), conf=conf_thres, verbose=False)[0]
         dets = []
         if res.boxes is not None and len(res.boxes) > 0:
@@ -214,7 +209,7 @@ def process_video(
                 name = model.names[int(c)]
                 if name in person_names or name in bag_names:
                     x1,y1,x2,y2 = b
-                    if (x2-x1)*(y2-y1) < min_box_area_px:  # tiny/far objects → ignore
+                    if (x2-x1)*(y2-y1) < min_box_area_px:  # ignore tiny/far objects
                         continue
                     dets.append((b.tolist(), name, float(s)))
 
@@ -223,19 +218,24 @@ def process_video(
         persons = [(tid, t) for tid,t in tracks.items() if t['cls'] in person_names and t['lost']==0]
         bags    = [(tid, t) for tid,t in tracks.items() if t['cls'] in bag_names and t['lost']==0]
 
-        # 3a) append stabilized + smoothed centers and heights
+        # 3a) append stabilized features (centers, foot point, heights) for active tracks
         for _, t in tracks.items():
-            cx, cy = xyxy_to_cxcy(t['box'])
-            # subtract cumulative camera shift
-            stab_c = (cx - cum_shift[0], cy - cum_shift[1])
+            if t['lost'] != 0:  # only update live
+                continue
+            x1,y1,x2,y2 = t['box']; cx, cy = 0.5*(x1+x2), 0.5*(y1+y2)
+            foot = (cx, y2)
+            stab_c    = (cx   - cum_shift[0], cy    - cum_shift[1])
+            stab_foot = (foot[0]-cum_shift[0], foot[1]-cum_shift[1])
+
             if len(t['history_stab']) == 0:
                 t['history_stab'].append(stab_c)
+                t['foot_hist'].append(stab_foot)
             else:
-                t['history_stab'].append(ema(t['history_stab'][-1], stab_c, alpha=0.6))
-            h = float(t['box'][3] - t['box'][1])
-            t['hist_h'].append(h)
+                t['history_stab'].append(ema(t['history_stab'][-1], stab_c, alpha=0.4))
+                t['foot_hist'].append(ema(t['foot_hist'][-1],     stab_foot, alpha=0.4))
+            t['hist_h'].append(float(y2 - y1))
 
-        # 4) bag–person proximity for abandonment
+        # 4) bag–person proximity
         for btid, bt in bags:
             for ptid, pt in persons:
                 bcx,bcy = xyxy_to_cxcy(bt['box']); pcx,pcy = xyxy_to_cxcy(pt['box'])
@@ -254,14 +254,13 @@ def process_video(
             hist = list(pt['history_stab'])[-45:]
             stationary = False
             if len(hist) >= 5:
-                d = np.linalg.norm(np.diff(np.array(hist), axis=0), axis=1)  # px/frame (stabilized + smoothed)
+                d = np.linalg.norm(np.diff(np.array(hist), axis=0), axis=1)  # px/frame (stabilized)
                 avg_speed = float(np.median(d)) * fps
                 spread = np.linalg.norm(np.array(hist).max(0) - np.array(hist).min(0))
                 stationary = (avg_speed < speed_px_per_sec_thr) and (spread < 2*radius_px_thr)
 
             if inside and stationary:
-                if pt['stationary_since'] is None:
-                    pt['stationary_since'] = frame_idx
+                if pt['stationary_since'] is None: pt['stationary_since'] = frame_idx
             else:
                 pt['stationary_since'] = None; pt['loiter_alerted'] = False
 
@@ -276,7 +275,7 @@ def process_video(
                                "snapshot":pth})
                 pt['loiter_alerted'] = True
 
-        # 6) UNUSUAL (running-style) — conservative
+        # 6) UNUSUAL (running-style) — normalized foot-point speed
         if enable_unusual:
             for ptid, pt in persons:
                 if one_unusual_per_track and pt.get('unusual_fired', False): 
@@ -286,25 +285,22 @@ def process_video(
                 if not in_roi(pt['box'], roi_poly, W, H):
                     continue
 
-                # speeds on stabilized centers, normalized by body height (body-lengths/sec)
-                centers = list(pt['history_stab'])
-                heights = list(pt['hist_h'])
-                if len(centers) < 10 or len(heights) < 10:
+                feet = list(pt.get('foot_hist', [])); heights = list(pt.get('hist_h', []))
+                if len(feet) < 12 or len(heights) < 12:
                     continue
-                traj = np.array(centers[-45:])
-                v = np.diff(traj, axis=0)                   # px/frame
-                speed_pps = np.linalg.norm(v, axis=1) * fps # px/sec
+
+                traj = np.array(feet[-45:])
+                v = np.diff(traj, axis=0)                     # px/frame
+                speed_pps = np.linalg.norm(v, axis=1) * fps   # px/sec
                 med_h = float(np.median(heights[-45:])) or 1.0
-                bls = speed_pps / max(1.0, med_h)           # body-lengths/sec
+                bls = speed_pps / max(1.0, med_h)            # body-lengths/sec
+
                 med_bls = float(np.median(bls))
                 p90_bls = float(np.percentile(bls, 90))
-
-                # require clearly high normalized speed (running), sustained
-                is_fast = (p90_bls >= norm_speed_bls_thr) and (med_bls >= 0.8*norm_speed_bls_thr)
+                is_fast = (p90_bls >= norm_speed_bls_thr) and (med_bls >= 0.85 * norm_speed_bls_thr)
 
                 if is_fast:
-                    if pt.get('unusual_since') is None:
-                        pt['unusual_since'] = frame_idx
+                    if pt.get('unusual_since') is None: pt['unusual_since'] = frame_idx
                 else:
                     pt['unusual_since'] = None
 
@@ -351,31 +347,31 @@ def process_video(
     df.to_csv(csv_path, index=False)
     return df, snaps_dir, csv_path
 
-# =============== Streamlit UI ===============
+# ----------------- Streamlit UI -----------------
 st.set_page_config(page_title="AI Video Anomaly Detector", layout="wide")
-st.title("🕵️ AI Video Anomaly Detector — robust unusual (running)")
+st.title("🕵️ AI Video Anomaly Detector — robust running detection")
 
 with st.sidebar:
     st.header("⚙️ Settings")
     weights = st.text_input("YOLO weights", "yolov8n.pt")
     conf_thres = st.slider("Detection confidence", 0.1, 0.8, 0.45, 0.01)
 
-    # Loitering
-    loiter_sec = st.slider("Loitering seconds", 10, 180, 60, 1)
-    speed_thr  = st.slider("Stationary speed < px/sec", 5, 80, 25, 1)
+    # Loitering (your preferred values)
+    loiter_sec = st.slider("Loitering seconds", 5, 180, 10, 1)
+    speed_thr  = st.slider("Stationary speed < px/sec", 5, 80, 27, 1)
     radius_thr = st.slider("Stationary radius (px)", 5, 80, 20, 1)
 
-    # Unusual (running) — conservative
+    # Unusual (running) — conservative but responsive
     enable_unusual = st.checkbox("Enable unusual movement (running)", True)
-    norm_speed_thr = st.slider("Normalized speed (body-lengths/sec)", 0.8, 3.0, 1.5, 0.1)
-    min_unusual    = st.slider("Min unusual duration (sec)", 0.5, 5.0, 2.0, 0.1)
+    norm_speed_thr = st.slider("Normalized speed (body-lengths/sec)", 1.0, 3.0, 1.30, 0.05)
+    min_unusual    = st.slider("Min unusual duration (sec)", 0.5, 5.0, 1.2, 0.1)
     cooldown       = st.slider("Cooldown between alerts (sec)", 0.0, 8.0, 4.0, 0.5)
     one_per_track  = st.checkbox("Only 1 unusual alert per person", True)
     min_track_age  = st.slider("Ignore tracks younger than (sec)", 0.0, 3.0, 1.0, 0.1)
 
-    # Abandoned Bag
-    bag_stat_sec  = st.slider("Bag stationary seconds", 5, 120, 25, 1)
-    owner_gap_s   = st.slider("Owner-away seconds", 1, 30, 12, 1)
+    # Abandoned Bag (your preferred values)
+    bag_stat_sec  = st.slider("Bag stationary seconds", 3, 120, 8, 1)
+    owner_gap_s   = st.slider("Owner-away seconds", 1, 30, 8, 1)
 
     # Filters
     min_box_area  = st.slider("Ignore small boxes (frame %)", 0.0, 5.0, 1.0, 0.1)
