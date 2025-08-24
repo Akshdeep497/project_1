@@ -1,7 +1,6 @@
-# AI Surveillance — Streamlit app (Loitering + Abandoned Bag + Conservative Unusual Movement)
-# Run:
-#   pip install -r requirements.txt
-#   streamlit run app.py
+# Streamlit: Loitering + Abandoned Bag + Robust Unusual (running) detection
+# Less sensitive unusual: camera stabilization + body-lengths/sec + longer sustain
+# Run: pip install -r requirements.txt && streamlit run app.py
 
 import os, io, zipfile, tempfile, time, math
 from collections import deque
@@ -12,15 +11,14 @@ import pandas as pd
 import streamlit as st
 from ultralytics import YOLO
 
-# headless OpenCV + robust reader fallback
 import cv2
 import imageio.v3 as iio
 
-# -------------------- helpers --------------------
+# =============== helpers ===============
 def iou(a, b):
-    inter_x1 = max(a[0], b[0]); inter_y1 = max(a[1], b[1])
-    inter_x2 = min(a[2], b[2]); inter_y2 = min(a[3], b[3])
-    iw = max(0, inter_x2 - inter_x1 + 1); ih = max(0, inter_y2 - inter_y1 + 1)
+    x1 = max(a[0], b[0]); y1 = max(a[1], b[1])
+    x2 = min(a[2], b[2]); y2 = min(a[3], b[3])
+    iw = max(0, x2 - x1 + 1); ih = max(0, y2 - y1 + 1)
     inter = iw * ih
     if inter == 0: return 0.0
     area_a = (a[2]-a[0]+1)*(a[3]-a[1]+1)
@@ -29,7 +27,7 @@ def iou(a, b):
 
 def xyxy_to_cxcy(box):
     x1,y1,x2,y2 = box
-    return ((x1+x2)/2.0, (y1+y2)/2.0)
+    return (0.5*(x1+x2), 0.5*(y1+y2))
 
 def draw_label(img, box, label, color=(0,255,255)):
     x1,y1,x2,y2 = map(int, box)
@@ -40,10 +38,10 @@ def draw_label(img, box, label, color=(0,255,255)):
     cv2.putText(img, label, (x1+4, y1-4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 1, cv2.LINE_AA)
 
 class SimpleTracker:
-    """Tiny IoU-greedy tracker with short history for motion cues."""
+    """Tiny IoU-greedy tracker with motion history."""
     def __init__(self, iou_thr=0.4, max_lost=20, history_len=90):
         self.next_id = 1
-        self.tracks = {}   # id -> dict
+        self.tracks = {}
         self.iou_thr = iou_thr
         self.max_lost = max_lost
         self.history_len = history_len
@@ -52,7 +50,7 @@ class SimpleTracker:
         boxes = [d[0] for d in dets]
         unmatched = set(range(len(dets)))
 
-        # match existing
+        # match
         for tid, t in list(self.tracks.items()):
             best_j = -1; best_iou = 0.0
             for j in list(unmatched):
@@ -64,7 +62,8 @@ class SimpleTracker:
                 t['cls'] = dets[best_j][1]
                 t['conf'] = dets[best_j][2]
                 t['lost'] = 0
-                t['history'].append(xyxy_to_cxcy(boxes[best_j]))
+                # raw center history (we also keep stabilized history externally)
+                t['history_raw'].append(xyxy_to_cxcy(boxes[best_j]))
                 unmatched.discard(best_j)
             else:
                 t['lost'] += 1
@@ -76,120 +75,137 @@ class SimpleTracker:
         # new tracks
         for j in unmatched:
             self.tracks[self.next_id] = {
-                'box': boxes[j],
-                'cls': dets[j][1],
-                'conf': dets[j][2],
-                'lost': 0,
-                'history': deque([xyxy_to_cxcy(boxes[j])], maxlen=self.history_len),
+                'box': boxes[j], 'cls': dets[j][1], 'conf': dets[j][2], 'lost': 0,
+                'history_raw': deque([xyxy_to_cxcy(boxes[j])], maxlen=self.history_len),
+                'history_stab': deque(maxlen=self.history_len), # stabilized centers
+                'hist_h': deque(maxlen=self.history_len),       # bbox heights
                 # behavior state
-                'entered_roi_frame': None,
-                'loiter_alerted': False,
-                'stationary_since': None,
-                'stationary_frames': 0,
+                'entered_roi_frame': None, 'loiter_alerted': False,
+                'stationary_since': None, 'stationary_frames': 0,
                 'last_person_near_frame': -10_000,
                 # unusual
-                'unusual_since': None,
-                'last_unusual_frame': -10_000,
-                'unusual_fired': False,
-                'age_frames': 0
+                'unusual_since': None, 'last_unusual_frame': -10_000,
+                'unusual_fired': False, 'age_frames': 0
             }
             self.next_id += 1
 
-        # age tracks
+        # age
         for t in self.tracks.values():
             if t['lost'] == 0: t['age_frames'] = t.get('age_frames', 0) + 1
 
         return self.tracks
 
-def in_roi(box, roi_poly, w, h):
-    if roi_poly is None or len(roi_poly) < 3:
-        return True
-    cx, cy = xyxy_to_cxcy(box)
-    return cv2.pointPolygonTest(np.array(roi_poly, dtype=np.int32), (int(cx), int(cy)), False) >= 0
+class GlobalMotion:
+    """Global translation via phase correlation (to stabilize camera shake/pan)."""
+    def __init__(self, scale=0.5):
+        self.prev = None
+        self.scale = scale
+        self.win = None
+        self.cum = np.array([0.0, 0.0], dtype=np.float32)
+
+    def update(self, frame_bgr):
+        g = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        small = cv2.resize(g, None, fx=self.scale, fy=self.scale, interpolation=cv2.INTER_AREA)
+        f32 = small.astype(np.float32)
+        if self.prev is None:
+            self.prev = f32
+            self.win = cv2.createHanningWindow((f32.shape[1], f32.shape[0]), cv2.CV_32F)
+            return self.cum.copy()  # zero shift initially
+        # phase correlation (windowed)
+        (dx, dy), _ = cv2.phaseCorrelate(self.prev * self.win, f32 * self.win)
+        self.prev = f32
+        # convert to full-res pixels (note: phaseCorrelate returns (dx, dy) in x,y order)
+        self.cum += np.array([dx / self.scale, dy / self.scale], dtype=np.float32)
+        return self.cum.copy()
 
 def open_video_iter(path):
-    """Try cv2 first; if it fails, fall back to imageio iterator."""
     cap = cv2.VideoCapture(path)
     if cap.isOpened():
         fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or None
+        W  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        N  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or None
         def gen():
             while True:
-                ok, frame = cap.read()
+                ok, f = cap.read()
                 if not ok: break
-                yield frame
+                yield f
             cap.release()
-        return gen(), fps, width, height, n_frames
-
-    props = iio.improps(path)
-    fps = props.fps or 25.0
-    (width, height) = props.size
-    n_frames = props.n_frames
+        return gen(), fps, W, H, N
+    props = iio.improps(path); fps = props.fps or 25.0; (W, H) = props.size; N = props.n_frames
     def gen():
-        for frame_rgb in iio.imiter(path):
-            yield cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-    return gen(), fps, width, height, n_frames
+        for frgb in iio.imiter(path):
+            yield cv2.cvtColor(frgb, cv2.COLOR_RGB2BGR)
+    return gen(), fps, W, H, N
 
-# -------------------- core pipeline --------------------
+def in_roi(box, roi_poly, W, H):
+    if roi_poly is None or len(roi_poly) < 3: return True
+    cx, cy = xyxy_to_cxcy(box)
+    return cv2.pointPolygonTest(np.array(roi_poly, dtype=np.int32), (int(cx), int(cy)), False) >= 0
+
+# =============== core pipeline ===============
 def process_video(
     source_path: str,
     out_dir: str,
     weights: str = "yolov8n.pt",
     conf_thres: float = 0.45,
-    # loitering
+    # Loitering
     loiter_sec: float = 60.0,
     speed_px_per_sec_thr: float = 25.0,
     radius_px_thr: float = 20.0,
-    history_win: int = 45,          # longer window → steadier stats
-    # unusual movement (CONSERVATIVE defaults)
+    # Unusual (conservative, running-focused)
     enable_unusual: bool = True,
-    unusual_speed_thr: float = 300.0,     # ↑ high threshold
-    heading_change_thr: float = 600.0,    # ↑ high threshold
-    min_unusual_sec: float = 2.0,         # ↑ must last longer
-    unusual_cooldown_sec: float = 4.0,    # ↑ gap between alerts
-    unusual_one_per_track: bool = True,   # only once per person
-    track_min_age_sec: float = 1.0,       # ignore brand-new tracks
-    # abandonment
+    norm_speed_bls_thr: float = 1.5,  # body-lengths/sec threshold (running ~1.5–2.5)
+    min_unusual_sec: float = 2.0,
+    unusual_cooldown_sec: float = 4.0,
+    one_unusual_per_track: bool = True,
+    min_track_age_sec: float = 1.0,
+    # Abandoned bag
     bag_stationary_sec: float = 25.0,
     owner_gap_sec: float = 12.0,
-    # filters
-    min_box_area_ratio: float = 0.010,  # ↑ ignore small boxes (1.0% of frame)
-    # misc
+    # Filters
+    min_box_area_ratio: float = 0.010,  # ignore tiny boxes (1% of frame)
+    history_len_frames: int = 90,       # longer window → steadier stats
+    # Misc
     progress_cb: Optional[Callable[[float], None]] = None,
     roi_poly: Optional[List[Tuple[int,int]]] = None
 ):
     os.makedirs(out_dir, exist_ok=True)
-    snaps_dir = os.path.join(out_dir, "snaps")
-    os.makedirs(snaps_dir, exist_ok=True)
+    snaps_dir = os.path.join(out_dir, "snaps"); os.makedirs(snaps_dir, exist_ok=True)
 
     model = YOLO(weights)
-    frames_iter, fps, width, height, n_frames = open_video_iter(source_path)
+    frames, fps, W, H, N = open_video_iter(source_path)
 
-    tracker = SimpleTracker(history_len=max(60, int(2.5*fps)))
-    person_names = {"person"}
-    bag_names = {"backpack", "handbag", "suitcase"}
+    tracker = SimpleTracker(history_len=history_len_frames)
+    gm = GlobalMotion(scale=0.5)
 
     loiter_frames = int(loiter_sec * fps)
-    bag_stationary_frames = int(bag_stationary_sec * fps)
-    owner_gap_frames = int(owner_gap_sec * fps)
-    near_dist_px = max(40, int(min(width, height) * 0.15))
-    border_margin = int(0.03 * min(width, height))
-    min_box_area_px = float(width * height) * float(min_box_area_ratio)
-
     min_unusual_frames = int(min_unusual_sec * fps)
     unusual_cooldown_frames = int(unusual_cooldown_sec * fps)
-    track_min_age_frames = int(track_min_age_sec * fps)
+    min_track_age_frames = int(min_track_age_sec * fps)
+    bag_stationary_frames = int(bag_stationary_sec * fps)
+    owner_gap_frames = int(owner_gap_sec * fps)
+    near_dist_px = max(40, int(min(W, H) * 0.15))
+    border_margin = int(0.03 * min(W, H))
+    min_box_area_px = float(W * H) * float(min_box_area_ratio)
+
+    person_names = {"person"}
+    bag_names = {"backpack","handbag","suitcase"}
 
     events = []
     frame_idx = -1
 
-    for frame in frames_iter:
+    # simple EMA smoothing for stabilized centers
+    def ema(prev, cur, alpha=0.6):
+        return (alpha*prev[0] + (1-alpha)*cur[0], alpha*prev[1] + (1-alpha)*cur[1])
+
+    for frame in frames:
         frame_idx += 1
 
-        # Detect persons + bags (filter tiny boxes)
-        res = model.predict(frame, imgsz=max(640, width), conf=conf_thres, verbose=False)[0]
+        # 1) global camera stabilization (cumulative shift)
+        cum_shift = gm.update(frame)  # (sx, sy) to subtract from centers
+
+        # 2) detect persons & bags (filter small)
+        res = model.predict(frame, imgsz=max(640, W), conf=conf_thres, verbose=False)[0]
         dets = []
         if res.boxes is not None and len(res.boxes) > 0:
             for b, c, s in zip(res.boxes.xyxy.cpu().numpy(),
@@ -198,37 +214,48 @@ def process_video(
                 name = model.names[int(c)]
                 if name in person_names or name in bag_names:
                     x1,y1,x2,y2 = b
-                    if (x2-x1)*(y2-y1) < min_box_area_px:
+                    if (x2-x1)*(y2-y1) < min_box_area_px:  # tiny/far objects → ignore
                         continue
                     dets.append((b.tolist(), name, float(s)))
 
+        # 3) tracking
         tracks = tracker.update(dets)
-        persons = [(tid, t) for tid,t in tracks.items() if t['cls'] in person_names and t['lost'] == 0]
-        bags    = [(tid, t) for tid,t in tracks.items() if t['cls'] in bag_names and t['lost'] == 0]
+        persons = [(tid, t) for tid,t in tracks.items() if t['cls'] in person_names and t['lost']==0]
+        bags    = [(tid, t) for tid,t in tracks.items() if t['cls'] in bag_names and t['lost']==0]
 
-        # bag-person proximity
+        # 3a) append stabilized + smoothed centers and heights
+        for _, t in tracks.items():
+            cx, cy = xyxy_to_cxcy(t['box'])
+            # subtract cumulative camera shift
+            stab_c = (cx - cum_shift[0], cy - cum_shift[1])
+            if len(t['history_stab']) == 0:
+                t['history_stab'].append(stab_c)
+            else:
+                t['history_stab'].append(ema(t['history_stab'][-1], stab_c, alpha=0.6))
+            h = float(t['box'][3] - t['box'][1])
+            t['hist_h'].append(h)
+
+        # 4) bag–person proximity for abandonment
         for btid, bt in bags:
             for ptid, pt in persons:
-                if np.hypot(*(np.array(xyxy_to_cxcy(bt['box'])) - np.array(xyxy_to_cxcy(pt['box'])))) < near_dist_px:
+                bcx,bcy = xyxy_to_cxcy(bt['box']); pcx,pcy = xyxy_to_cxcy(pt['box'])
+                if np.hypot(bcx-pcx, bcy-pcy) < near_dist_px:
                     bt['last_person_near_frame'] = frame_idx
                     break
 
-        # ---------- LOITERING (stationary dwell) ----------
+        # 5) LOITERING (stationary dwell)
         for ptid, pt in persons:
             x1,y1,x2,y2 = map(int, pt['box'])
-            # ignore near-frame edges (entrance/exit)
-            if x1 < border_margin or y1 < border_margin or x2 > width-border_margin or y2 > height-border_margin:
-                pt['entered_roi_frame'] = None
-                pt['loiter_alerted'] = False
-                pt['stationary_since'] = None
+            if x1 < border_margin or y1 < border_margin or x2 > W-border_margin or y2 > H-border_margin:
+                pt['entered_roi_frame'] = None; pt['loiter_alerted'] = False; pt['stationary_since'] = None
                 continue
 
-            inside = in_roi(pt['box'], roi_poly, width, height)
-            hist = list(pt['history'])[-history_win:]
+            inside = in_roi(pt['box'], roi_poly, W, H)
+            hist = list(pt['history_stab'])[-45:]
             stationary = False
             if len(hist) >= 5:
-                d = np.linalg.norm(np.diff(np.array(hist), axis=0), axis=1)  # px/frame
-                avg_speed = float(np.median(d)) * fps                           # px/sec (median = robust)
+                d = np.linalg.norm(np.diff(np.array(hist), axis=0), axis=1)  # px/frame (stabilized + smoothed)
+                avg_speed = float(np.median(d)) * fps
                 spread = np.linalg.norm(np.array(hist).max(0) - np.array(hist).min(0))
                 stationary = (avg_speed < speed_px_per_sec_thr) and (spread < 2*radius_px_thr)
 
@@ -236,65 +263,46 @@ def process_video(
                 if pt['stationary_since'] is None:
                     pt['stationary_since'] = frame_idx
             else:
-                pt['stationary_since'] = None
-                pt['loiter_alerted'] = False
+                pt['stationary_since'] = None; pt['loiter_alerted'] = False
 
-            if (pt['stationary_since'] is not None and
-                not pt['loiter_alerted'] and
+            if (pt['stationary_since'] is not None and not pt['loiter_alerted'] and
                 frame_idx - pt['stationary_since'] >= loiter_frames):
                 snap = frame.copy()
                 draw_label(snap, pt['box'], f"LOITER id={ptid}")
-                snap_path = os.path.join(snaps_dir, f"loiter_{frame_idx}_id{ptid}.jpg")
-                cv2.imwrite(snap_path, snap)
-                events.append({
-                    "type": "loitering",
-                    "video_time_sec": round(frame_idx / fps, 2),
-                    "frame": frame_idx,
-                    "track_id": ptid,
-                    "class": pt["cls"],
-                    "conf": round(pt["conf"], 3),
-                    "x1": int(pt["box"][0]), "y1": int(pt["box"][1]),
-                    "x2": int(pt["box"][2]), "y2": int(pt["box"][3]),
-                    "snapshot": snap_path
-                })
+                pth = os.path.join(snaps_dir, f"loiter_{frame_idx}_id{ptid}.jpg"); cv2.imwrite(pth, snap)
+                events.append({"type":"loitering","video_time_sec":round(frame_idx/fps,2),"frame":frame_idx,
+                               "track_id":ptid,"class":pt["cls"],"conf":round(pt["conf"],3),
+                               "x1":int(pt["box"][0]),"y1":int(pt["box"][1]),"x2":int(pt["box"][2]),"y2":int(pt["box"][3]),
+                               "snapshot":pth})
                 pt['loiter_alerted'] = True
 
-        # ---------- UNUSUAL MOVEMENT (conservative) ----------
+        # 6) UNUSUAL (running-style) — conservative
         if enable_unusual:
             for ptid, pt in persons:
-                # fire at most once per track (optional)
-                if unusual_one_per_track and pt.get('unusual_fired', False):
+                if one_unusual_per_track and pt.get('unusual_fired', False): 
                     continue
-                # must be a stable, matured track
-                if pt.get('age_frames', 0) < track_min_age_frames:
+                if pt.get('age_frames', 0) < min_track_age_frames: 
+                    continue
+                if not in_roi(pt['box'], roi_poly, W, H):
                     continue
 
-                inside = in_roi(pt['box'], roi_poly, width, height)
-                hist = list(pt['history'])[-history_win:]
-                is_unusual_now = False
-                if inside and len(hist) >= min(10, history_win//2):
-                    traj = np.array(hist)
-                    v = np.diff(traj, axis=0)                     # px/frame
-                    speed_pps = np.linalg.norm(v, axis=1) * fps   # px/sec
-                    # use robust stats (less sensitive)
-                    med_speed = float(np.median(speed_pps))
-                    p90_speed = float(np.percentile(speed_pps, 90))
+                # speeds on stabilized centers, normalized by body height (body-lengths/sec)
+                centers = list(pt['history_stab'])
+                heights = list(pt['hist_h'])
+                if len(centers) < 10 or len(heights) < 10:
+                    continue
+                traj = np.array(centers[-45:])
+                v = np.diff(traj, axis=0)                   # px/frame
+                speed_pps = np.linalg.norm(v, axis=1) * fps # px/sec
+                med_h = float(np.median(heights[-45:])) or 1.0
+                bls = speed_pps / max(1.0, med_h)           # body-lengths/sec
+                med_bls = float(np.median(bls))
+                p90_bls = float(np.percentile(bls, 90))
 
-                    headings = np.array([math.atan2(dy, dx) for dx,dy in v])
-                    if len(headings) >= 2:
-                        dh = np.diff(headings)
-                        dh = (dh + np.pi) % (2*np.pi) - np.pi
-                        dir_change_deg_per_sec = math.degrees(np.mean(np.abs(dh))) * fps
-                    else:
-                        dir_change_deg_per_sec = 0.0
+                # require clearly high normalized speed (running), sustained
+                is_fast = (p90_bls >= norm_speed_bls_thr) and (med_bls >= 0.8*norm_speed_bls_thr)
 
-                    fast = (p90_speed > unusual_speed_thr) and (med_speed > 0.8*unusual_speed_thr)
-                    erratic = (dir_change_deg_per_sec > heading_change_thr) and (med_speed > 40.0)
-
-                    is_unusual_now = fast or erratic
-
-                # sustain timer
-                if is_unusual_now:
+                if is_fast:
                     if pt.get('unusual_since') is None:
                         pt['unusual_since'] = frame_idx
                 else:
@@ -307,88 +315,70 @@ def process_video(
                 if long_enough and cooldown_ok:
                     snap = frame.copy()
                     draw_label(snap, pt['box'], f"UNUSUAL id={ptid}")
-                    snap_path = os.path.join(snaps_dir, f"unusual_{frame_idx}_id{ptid}.jpg")
-                    cv2.imwrite(snap_path, snap)
-                    events.append({
-                        "type": "unusual_movement",
-                        "video_time_sec": round(frame_idx / fps, 2),
-                        "frame": frame_idx,
-                        "track_id": ptid,
-                        "class": pt["cls"],
-                        "conf": round(pt["conf"], 3),
-                        "x1": int(pt["box"][0]), "y1": int(pt["box"][1]),
-                        "x2": int(pt["box"][2]), "y2": int(pt["box"][3]),
-                        "snapshot": snap_path
-                    })
+                    pth = os.path.join(snaps_dir, f"unusual_{frame_idx}_id{ptid}.jpg"); cv2.imwrite(pth, snap)
+                    events.append({"type":"unusual_movement","video_time_sec":round(frame_idx/fps,2),"frame":frame_idx,
+                                   "track_id":ptid,"class":pt["cls"],"conf":round(pt["conf"],3),
+                                   "x1":int(pt["box"][0]),"y1":int(pt["box"][1]),"x2":int(pt["box"][2]),"y2":int(pt["box"][3]),
+                                   "snapshot":pth})
                     pt['last_unusual_frame'] = frame_idx
-                    if unusual_one_per_track:
-                        pt['unusual_fired'] = True
+                    if one_unusual_per_track: pt['unusual_fired'] = True
 
-        # ---------- ABANDONED BAG ----------
+        # 7) Abandoned Bag
         for btid, bt in bags:
-            if len(bt['history']) >= 2:
-                (x1,y1) = bt['history'][-2]; (x2,y2) = bt['history'][-1]
-                moved = np.hypot(x2-x1, y2-y1)
-            else: moved = 0
+            hist = list(bt['history_stab'])
+            if len(hist) >= 2:
+                moved = np.linalg.norm(np.array(hist[-1]) - np.array(hist[-2]))
+            else:
+                moved = 0
             bt['stationary_frames'] = bt['stationary_frames'] + 1 if moved < 1.5 else 0
             owner_gap_ok = (frame_idx - bt['last_person_near_frame']) >= owner_gap_frames
 
             if bt['stationary_frames'] >= bag_stationary_frames and owner_gap_ok:
                 snap = frame.copy()
                 draw_label(snap, bt['box'], f"ABANDONED id={btid}")
-                snap_path = os.path.join(snaps_dir, f"abandoned_{frame_idx}_id{btid}.jpg")
-                cv2.imwrite(snap_path, snap)
-                events.append({
-                    "type": "abandoned_bag",
-                    "video_time_sec": round(frame_idx / fps, 2),
-                    "frame": frame_idx,
-                    "track_id": btid,
-                    "class": bt["cls"],
-                    "conf": round(bt["conf"], 3),
-                    "x1": int(bt["box"][0]), "y1": int(bt["box"][1]),
-                    "x2": int(bt["box"][2]), "y2": int(bt["box"][3]),
-                    "snapshot": snap_path
-                })
+                pth = os.path.join(snaps_dir, f"abandoned_{frame_idx}_id{btid}.jpg"); cv2.imwrite(pth, snap)
+                events.append({"type":"abandoned_bag","video_time_sec":round(frame_idx/fps,2),"frame":frame_idx,
+                               "track_id":btid,"class":bt["cls"],"conf":round(bt["conf"],3),
+                               "x1":int(bt["box"][0]),"y1":int(bt["box"][1]),"x2":int(bt["box"][2]),"y2":int(bt["box"][3]),
+                               "snapshot":pth})
                 bt['stationary_frames'] = -999999  # cooldown
 
-        if progress_cb and n_frames:
-            progress_cb(min(1.0, frame_idx / max(1, n_frames)))
+        if progress_cb and N:
+            progress_cb(min(1.0, frame_idx / max(1, N)))
 
     df = pd.DataFrame(events).sort_values(["video_time_sec", "frame"]).reset_index(drop=True)
     csv_path = os.path.join(out_dir, "events.csv")
     df.to_csv(csv_path, index=False)
     return df, snaps_dir, csv_path
 
-# -------------------- streamlit UI --------------------
+# =============== Streamlit UI ===============
 st.set_page_config(page_title="AI Video Anomaly Detector", layout="wide")
-st.title("🕵️ AI Video Anomaly Detector")
-st.caption("Upload a video → detect **Loitering**, **Unusual Movement (conservative)**, **Abandoned Bag**; get a timeline + screenshots.")
+st.title("🕵️ AI Video Anomaly Detector — robust unusual (running)")
 
 with st.sidebar:
     st.header("⚙️ Settings")
     weights = st.text_input("YOLO weights", "yolov8n.pt")
     conf_thres = st.slider("Detection confidence", 0.1, 0.8, 0.45, 0.01)
 
-    # LOITERING
+    # Loitering
     loiter_sec = st.slider("Loitering seconds", 10, 180, 60, 1)
     speed_thr  = st.slider("Stationary speed < px/sec", 5, 80, 25, 1)
     radius_thr = st.slider("Stationary radius (px)", 5, 80, 20, 1)
 
-    # UNUSUAL (conservative)
-    enable_unusual = st.checkbox("Enable unusual movement", True)
-    unusual_speed  = st.slider("Unusual speed > px/sec", 120, 500, 300, 5)
-    heading_thr    = st.slider("Heading change > deg/sec", 180, 900, 600, 10)
+    # Unusual (running) — conservative
+    enable_unusual = st.checkbox("Enable unusual movement (running)", True)
+    norm_speed_thr = st.slider("Normalized speed (body-lengths/sec)", 0.8, 3.0, 1.5, 0.1)
     min_unusual    = st.slider("Min unusual duration (sec)", 0.5, 5.0, 2.0, 0.1)
     cooldown       = st.slider("Cooldown between alerts (sec)", 0.0, 8.0, 4.0, 0.5)
-    one_per_track  = st.checkbox("Unusual: only 1 alert per track", True)
+    one_per_track  = st.checkbox("Only 1 unusual alert per person", True)
     min_track_age  = st.slider("Ignore tracks younger than (sec)", 0.0, 3.0, 1.0, 0.1)
 
-    # ABANDONED BAG
+    # Abandoned Bag
     bag_stat_sec  = st.slider("Bag stationary seconds", 5, 120, 25, 1)
     owner_gap_s   = st.slider("Owner-away seconds", 1, 30, 12, 1)
 
-    # FILTERS
-    min_box_area  = st.slider("Ignore small boxes (frame %)", 0.0, 5.0, 1.0, 0.1)  # default 1%
+    # Filters
+    min_box_area  = st.slider("Ignore small boxes (frame %)", 0.0, 5.0, 1.0, 0.1)
 
 uploaded = st.file_uploader("Upload a video (mp4/avi/mov/mkv)", type=["mp4","avi","mov","mkv"])
 run = st.button("▶️ Run Detection", disabled=(uploaded is None))
@@ -396,41 +386,25 @@ run = st.button("▶️ Run Detection", disabled=(uploaded is None))
 if run and uploaded:
     tmp_dir = tempfile.mkdtemp(prefix="anomaly_")
     src_path = os.path.join(tmp_dir, uploaded.name)
-    with open(src_path, "wb") as f:
-        f.write(uploaded.read())
-
+    with open(src_path, "wb") as f: f.write(uploaded.read())
     out_dir = os.path.join(tmp_dir, "outputs")
     st.info("Processing video…")
 
     prog = st.progress(0.0)
     def _cb(p): prog.progress(p)
-
     t0 = time.time()
     try:
         df, snaps_dir, csv_path = process_video(
-            source_path=src_path,
-            out_dir=out_dir,
-            weights=weights,
-            conf_thres=conf_thres,
-            loiter_sec=loiter_sec,
-            speed_px_per_sec_thr=speed_thr,
-            radius_px_thr=radius_thr,
-            enable_unusual=enable_unusual,
-            unusual_speed_thr=unusual_speed,
-            heading_change_thr=heading_thr,
-            min_unusual_sec=min_unusual,
-            unusual_cooldown_sec=cooldown,
-            unusual_one_per_track=one_per_track,
-            track_min_age_sec=min_track_age,
-            bag_stationary_sec=bag_stat_sec,
-            owner_gap_sec=owner_gap_s,
-            min_box_area_ratio=min_box_area/100.0,  # percent → fraction
-            progress_cb=_cb,
-            roi_poly=None
+            source_path=src_path, out_dir=out_dir, weights=weights, conf_thres=conf_thres,
+            loiter_sec=loiter_sec, speed_px_per_sec_thr=speed_thr, radius_px_thr=radius_thr,
+            enable_unusual=enable_unusual, norm_speed_bls_thr=norm_speed_thr,
+            min_unusual_sec=min_unusual, unusual_cooldown_sec=cooldown,
+            one_unusual_per_track=one_per_track, min_track_age_sec=min_track_age,
+            bag_stationary_sec=bag_stat_sec, owner_gap_sec=owner_gap_s,
+            min_box_area_ratio=min_box_area/100.0, progress_cb=_cb, roi_poly=None
         )
     except Exception as e:
-        st.error(f"Error: {e}")
-        st.stop()
+        st.error(f"Error: {e}"); st.stop()
     finally:
         prog.progress(1.0)
 
@@ -454,13 +428,11 @@ if run and uploaded:
                     st.image(snap, use_column_width=True,
                              caption=f"{row['type']} • t={row['video_time_sec']}s • id={row['track_id']}")
 
-        # downloads
         csv_bytes = df.to_csv(index=False).encode("utf-8")
-        st.download_button("⬇️ Download events.csv", data=csv_bytes,
-                           file_name="events.csv", mime="text/csv")
+        st.download_button("⬇️ Download events.csv", data=csv_bytes, file_name="events.csv", mime="text/csv")
 
         mem = io.BytesIO()
-        with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        with zipfile.ZipFile(mem, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("events.csv", csv_bytes)
             for _, row in df.iterrows():
                 snap = row["snapshot"]
