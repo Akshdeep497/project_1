@@ -1,5 +1,5 @@
 # Streamlit: Loitering + Abandoned Bag + robust Unusual (running) detection
-# Uses camera stabilization + foot-point motion normalized by body height.
+# Includes safe handling for "no events" → no KeyError on video_time_sec
 # Run:
 #   pip install -r requirements.txt
 #   streamlit run app.py
@@ -143,7 +143,7 @@ def process_video(
     out_dir: str,
     weights: str = "yolov8n.pt",
     conf_thres: float = 0.45,
-    # Loitering
+    # Loitering (defaults per your screenshots)
     loiter_sec: float = 10.0,
     speed_px_per_sec_thr: float = 27.0,
     radius_px_thr: float = 20.0,
@@ -154,7 +154,7 @@ def process_video(
     unusual_cooldown_sec: float = 4.0,
     one_unusual_per_track: bool = True,
     min_track_age_sec: float = 1.0,
-    # Abandoned bag
+    # Abandoned bag (defaults per your screenshots)
     bag_stationary_sec: float = 8.0,
     owner_gap_sec: float = 8.0,
     # Filters
@@ -189,7 +189,7 @@ def process_video(
     events = []
     frame_idx = -1
 
-    # EMA smoothing for stabilized features (light smoothing, more responsive)
+    # EMA smoothing for stabilized features (light smoothing, responsive)
     def ema(prev, cur, alpha=0.4):
         return (alpha*prev[0] + (1-alpha)*cur[0], alpha*prev[1] + (1-alpha)*cur[1])
 
@@ -220,7 +220,7 @@ def process_video(
 
         # 3a) append stabilized features (centers, foot point, heights) for active tracks
         for _, t in tracks.items():
-            if t['lost'] != 0:  # only update live
+            if t['lost'] != 0:
                 continue
             x1,y1,x2,y2 = t['box']; cx, cy = 0.5*(x1+x2), 0.5*(y1+y2)
             foot = (cx, y2)
@@ -342,7 +342,13 @@ def process_video(
         if progress_cb and N:
             progress_cb(min(1.0, frame_idx / max(1, N)))
 
-    df = pd.DataFrame(events).sort_values(["video_time_sec", "frame"]).reset_index(drop=True)
+    # ---- build results dataframe safely even if there are no events ----
+    cols = ["type","video_time_sec","frame","track_id","class","conf","x1","y1","x2","y2","snapshot"]
+    if len(events):
+        df = pd.DataFrame(events)[cols].sort_values(["video_time_sec","frame"]).reset_index(drop=True)
+    else:
+        df = pd.DataFrame(columns=cols)
+
     csv_path = os.path.join(out_dir, "events.csv")
     df.to_csv(csv_path, index=False)
     return df, snaps_dir, csv_path
@@ -405,12 +411,16 @@ if run and uploaded:
         prog.progress(1.0)
 
     st.success(f"Done in {time.time()-t0:.1f}s • {len(df)} events")
+
+    # metrics (works even if df is empty)
     c1, c2, c3 = st.columns(3)
     with c1: st.metric("Loitering", int((df["type"]=="loitering").sum()))
     with c2: st.metric("Unusual Movement", int((df["type"]=="unusual_movement").sum()))
     with c3: st.metric("Abandoned Bag", int((df["type"]=="abandoned_bag").sum()))
 
-    if len(df):
+    if len(df) == 0:
+        st.info("No anomalies detected in this clip.")
+    else:
         st.subheader("Timeline")
         st.dataframe(df[["type","video_time_sec","frame","track_id","class","conf","snapshot"]],
                      use_container_width=True, height=320)
@@ -424,8 +434,10 @@ if run and uploaded:
                     st.image(snap, use_column_width=True,
                              caption=f"{row['type']} • t={row['video_time_sec']}s • id={row['track_id']}")
 
+        # downloads
         csv_bytes = df.to_csv(index=False).encode("utf-8")
-        st.download_button("⬇️ Download events.csv", data=csv_bytes, file_name="events.csv", mime="text/csv")
+        st.download_button("⬇️ Download events.csv", data=csv_bytes,
+                           file_name="events.csv", mime="text/csv")
 
         mem = io.BytesIO()
         with zipfile.ZipFile(mem, "w", zipfile.ZIP_DEFLATED) as zf:
