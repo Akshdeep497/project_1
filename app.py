@@ -1,4 +1,4 @@
-# AI Surveillance — Streamlit app (Loitering + Abandoned Bag only)
+# AI Surveillance — Streamlit app (Loitering + Abandoned Bag + Conservative Unusual Movement)
 # Run:
 #   pip install -r requirements.txt
 #   streamlit run app.py
@@ -41,7 +41,7 @@ def draw_label(img, box, label, color=(0,255,255)):
 
 class SimpleTracker:
     """Tiny IoU-greedy tracker with short history for motion cues."""
-    def __init__(self, iou_thr=0.4, max_lost=20, history_len=60):
+    def __init__(self, iou_thr=0.4, max_lost=20, history_len=90):
         self.next_id = 1
         self.tracks = {}   # id -> dict
         self.iou_thr = iou_thr
@@ -86,9 +86,18 @@ class SimpleTracker:
                 'loiter_alerted': False,
                 'stationary_since': None,
                 'stationary_frames': 0,
-                'last_person_near_frame': -10_000
+                'last_person_near_frame': -10_000,
+                # unusual
+                'unusual_since': None,
+                'last_unusual_frame': -10_000,
+                'unusual_fired': False,
+                'age_frames': 0
             }
             self.next_id += 1
+
+        # age tracks
+        for t in self.tracks.values():
+            if t['lost'] == 0: t['age_frames'] = t.get('age_frames', 0) + 1
 
         return self.tracks
 
@@ -133,12 +142,20 @@ def process_video(
     loiter_sec: float = 60.0,
     speed_px_per_sec_thr: float = 25.0,
     radius_px_thr: float = 20.0,
-    history_win: int = 30,
+    history_win: int = 45,          # longer window → steadier stats
+    # unusual movement (CONSERVATIVE defaults)
+    enable_unusual: bool = True,
+    unusual_speed_thr: float = 300.0,     # ↑ high threshold
+    heading_change_thr: float = 600.0,    # ↑ high threshold
+    min_unusual_sec: float = 2.0,         # ↑ must last longer
+    unusual_cooldown_sec: float = 4.0,    # ↑ gap between alerts
+    unusual_one_per_track: bool = True,   # only once per person
+    track_min_age_sec: float = 1.0,       # ignore brand-new tracks
     # abandonment
     bag_stationary_sec: float = 25.0,
     owner_gap_sec: float = 12.0,
     # filters
-    min_box_area_ratio: float = 0.006,  # ignore tiny boxes (fraction of frame)
+    min_box_area_ratio: float = 0.010,  # ↑ ignore small boxes (1.0% of frame)
     # misc
     progress_cb: Optional[Callable[[float], None]] = None,
     roi_poly: Optional[List[Tuple[int,int]]] = None
@@ -150,7 +167,7 @@ def process_video(
     model = YOLO(weights)
     frames_iter, fps, width, height, n_frames = open_video_iter(source_path)
 
-    tracker = SimpleTracker()
+    tracker = SimpleTracker(history_len=max(60, int(2.5*fps)))
     person_names = {"person"}
     bag_names = {"backpack", "handbag", "suitcase"}
 
@@ -161,13 +178,17 @@ def process_video(
     border_margin = int(0.03 * min(width, height))
     min_box_area_px = float(width * height) * float(min_box_area_ratio)
 
+    min_unusual_frames = int(min_unusual_sec * fps)
+    unusual_cooldown_frames = int(unusual_cooldown_sec * fps)
+    track_min_age_frames = int(track_min_age_sec * fps)
+
     events = []
     frame_idx = -1
 
     for frame in frames_iter:
         frame_idx += 1
 
-        # Detect persons + bags
+        # Detect persons + bags (filter tiny boxes)
         res = model.predict(frame, imgsz=max(640, width), conf=conf_thres, verbose=False)[0]
         dets = []
         if res.boxes is not None and len(res.boxes) > 0:
@@ -178,7 +199,7 @@ def process_video(
                 if name in person_names or name in bag_names:
                     x1,y1,x2,y2 = b
                     if (x2-x1)*(y2-y1) < min_box_area_px:
-                        continue  # ignore tiny detections
+                        continue
                     dets.append((b.tolist(), name, float(s)))
 
         tracks = tracker.update(dets)
@@ -238,6 +259,71 @@ def process_video(
                 })
                 pt['loiter_alerted'] = True
 
+        # ---------- UNUSUAL MOVEMENT (conservative) ----------
+        if enable_unusual:
+            for ptid, pt in persons:
+                # fire at most once per track (optional)
+                if unusual_one_per_track and pt.get('unusual_fired', False):
+                    continue
+                # must be a stable, matured track
+                if pt.get('age_frames', 0) < track_min_age_frames:
+                    continue
+
+                inside = in_roi(pt['box'], roi_poly, width, height)
+                hist = list(pt['history'])[-history_win:]
+                is_unusual_now = False
+                if inside and len(hist) >= min(10, history_win//2):
+                    traj = np.array(hist)
+                    v = np.diff(traj, axis=0)                     # px/frame
+                    speed_pps = np.linalg.norm(v, axis=1) * fps   # px/sec
+                    # use robust stats (less sensitive)
+                    med_speed = float(np.median(speed_pps))
+                    p90_speed = float(np.percentile(speed_pps, 90))
+
+                    headings = np.array([math.atan2(dy, dx) for dx,dy in v])
+                    if len(headings) >= 2:
+                        dh = np.diff(headings)
+                        dh = (dh + np.pi) % (2*np.pi) - np.pi
+                        dir_change_deg_per_sec = math.degrees(np.mean(np.abs(dh))) * fps
+                    else:
+                        dir_change_deg_per_sec = 0.0
+
+                    fast = (p90_speed > unusual_speed_thr) and (med_speed > 0.8*unusual_speed_thr)
+                    erratic = (dir_change_deg_per_sec > heading_change_thr) and (med_speed > 40.0)
+
+                    is_unusual_now = fast or erratic
+
+                # sustain timer
+                if is_unusual_now:
+                    if pt.get('unusual_since') is None:
+                        pt['unusual_since'] = frame_idx
+                else:
+                    pt['unusual_since'] = None
+
+                long_enough = pt.get('unusual_since') is not None and \
+                              (frame_idx - pt['unusual_since']) >= min_unusual_frames
+                cooldown_ok = (frame_idx - pt.get('last_unusual_frame', -10_000)) >= unusual_cooldown_frames
+
+                if long_enough and cooldown_ok:
+                    snap = frame.copy()
+                    draw_label(snap, pt['box'], f"UNUSUAL id={ptid}")
+                    snap_path = os.path.join(snaps_dir, f"unusual_{frame_idx}_id{ptid}.jpg")
+                    cv2.imwrite(snap_path, snap)
+                    events.append({
+                        "type": "unusual_movement",
+                        "video_time_sec": round(frame_idx / fps, 2),
+                        "frame": frame_idx,
+                        "track_id": ptid,
+                        "class": pt["cls"],
+                        "conf": round(pt["conf"], 3),
+                        "x1": int(pt["box"][0]), "y1": int(pt["box"][1]),
+                        "x2": int(pt["box"][2]), "y2": int(pt["box"][3]),
+                        "snapshot": snap_path
+                    })
+                    pt['last_unusual_frame'] = frame_idx
+                    if unusual_one_per_track:
+                        pt['unusual_fired'] = True
+
         # ---------- ABANDONED BAG ----------
         for btid, bt in bags:
             if len(bt['history']) >= 2:
@@ -276,7 +362,7 @@ def process_video(
 # -------------------- streamlit UI --------------------
 st.set_page_config(page_title="AI Video Anomaly Detector", layout="wide")
 st.title("🕵️ AI Video Anomaly Detector")
-st.caption("Upload a video → detect **Loitering** and **Abandoned Bag**; get a timeline + screenshots.")
+st.caption("Upload a video → detect **Loitering**, **Unusual Movement (conservative)**, **Abandoned Bag**; get a timeline + screenshots.")
 
 with st.sidebar:
     st.header("⚙️ Settings")
@@ -288,12 +374,21 @@ with st.sidebar:
     speed_thr  = st.slider("Stationary speed < px/sec", 5, 80, 25, 1)
     radius_thr = st.slider("Stationary radius (px)", 5, 80, 20, 1)
 
+    # UNUSUAL (conservative)
+    enable_unusual = st.checkbox("Enable unusual movement", True)
+    unusual_speed  = st.slider("Unusual speed > px/sec", 120, 500, 300, 5)
+    heading_thr    = st.slider("Heading change > deg/sec", 180, 900, 600, 10)
+    min_unusual    = st.slider("Min unusual duration (sec)", 0.5, 5.0, 2.0, 0.1)
+    cooldown       = st.slider("Cooldown between alerts (sec)", 0.0, 8.0, 4.0, 0.5)
+    one_per_track  = st.checkbox("Unusual: only 1 alert per track", True)
+    min_track_age  = st.slider("Ignore tracks younger than (sec)", 0.0, 3.0, 1.0, 0.1)
+
     # ABANDONED BAG
     bag_stat_sec  = st.slider("Bag stationary seconds", 5, 120, 25, 1)
     owner_gap_s   = st.slider("Owner-away seconds", 1, 30, 12, 1)
 
     # FILTERS
-    min_box_area  = st.slider("Ignore small boxes (frame %)", 0.0, 5.0, 0.6, 0.1)  # %
+    min_box_area  = st.slider("Ignore small boxes (frame %)", 0.0, 5.0, 1.0, 0.1)  # default 1%
 
 uploaded = st.file_uploader("Upload a video (mp4/avi/mov/mkv)", type=["mp4","avi","mov","mkv"])
 run = st.button("▶️ Run Detection", disabled=(uploaded is None))
@@ -320,6 +415,13 @@ if run and uploaded:
             loiter_sec=loiter_sec,
             speed_px_per_sec_thr=speed_thr,
             radius_px_thr=radius_thr,
+            enable_unusual=enable_unusual,
+            unusual_speed_thr=unusual_speed,
+            heading_change_thr=heading_thr,
+            min_unusual_sec=min_unusual,
+            unusual_cooldown_sec=cooldown,
+            unusual_one_per_track=one_per_track,
+            track_min_age_sec=min_track_age,
             bag_stationary_sec=bag_stat_sec,
             owner_gap_sec=owner_gap_s,
             min_box_area_ratio=min_box_area/100.0,  # percent → fraction
@@ -333,10 +435,10 @@ if run and uploaded:
         prog.progress(1.0)
 
     st.success(f"Done in {time.time()-t0:.1f}s • {len(df)} events")
-    # Metrics (2 types only)
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns(3)
     with c1: st.metric("Loitering", int((df["type"]=="loitering").sum()))
-    with c2: st.metric("Abandoned Bag", int((df["type"]=="abandoned_bag").sum()))
+    with c2: st.metric("Unusual Movement", int((df["type"]=="unusual_movement").sum()))
+    with c3: st.metric("Abandoned Bag", int((df["type"]=="abandoned_bag").sum()))
 
     if len(df):
         st.subheader("Timeline")
